@@ -230,3 +230,120 @@ def call_openai_chat_parse(
         raise
     finally:
         db_session.close()
+
+
+def stream_openai_chat_create(
+    user_id: int,
+    model: str,
+    messages: list,
+    temperature: float = 0.7,
+    cost_per_prompt_token: decimal.Decimal = decimal.Decimal("0.0000025"),
+    cost_per_completion_token: decimal.Decimal = decimal.Decimal("0.00001"),
+    **kwargs
+):
+    """
+    A *streaming* version of call_openai_chat_create. Instead of returning
+    a single response, it yields partial text tokens as they arrive.
+    
+    At the end of the stream, it updates usage logs and user credits.
+    """
+
+    db_session = ScopedSession()
+    try:
+        # 1) Retrieve user
+        user = db_session.query(Users).filter_by(user_id=user_id).first()
+        if not user:
+            raise ValueError(f"User not found (user_id={user_id}).")
+
+        # 1a) Check user credits
+        if user.credits_remaining <= 0:
+            raise ValueError("User does not have enough credits to proceed.")
+
+        # 2) Make a streaming call to the OpenAI ChatCompletion endpoint
+        #    We set stream_options={"include_usage": True} so usage appears in the final chunk
+        response_iter = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            stream=True,
+            stream_options={"include_usage": True},  # usage in final chunk
+            **kwargs
+        )
+
+        # We'll define a generator function that yields text tokens
+        def token_generator():
+            usage_obj = None  # We'll grab from the final chunk
+
+            for chunk in response_iter:
+                # chunk is an OpenAI ChatCompletionChunk object
+                if chunk.choices and len(chunk.choices) > 0:
+                    delta = chunk.choices[0].delta
+                    # If there's new text content in this chunk
+                    if getattr(delta, "content", None):
+                        yield delta.content
+
+                # The usage field only appears in the last chunk
+                if chunk.usage is not None:
+                    usage_obj = chunk.usage
+
+            # Once streaming is done, usage_obj should be populated
+            if usage_obj:
+                _update_usage_and_credits(
+                    db_session=db_session,
+                    user=user,
+                    usage_obj=usage_obj,
+                    model=model,
+                    cost_per_prompt_token=cost_per_prompt_token,
+                    cost_per_completion_token=cost_per_completion_token
+                )
+
+        # Return that generator so the caller can iterate over partial tokens
+        return token_generator()
+
+    except Exception as e:
+        db_session.rollback()
+        raise
+    finally:
+        # We won't close the DB session immediately if we need it after the final chunk
+        # but typically you'd do so after usage is recorded
+        pass
+
+
+def _update_usage_and_credits(
+    db_session,
+    user: Users,
+    usage_obj,
+    model: str,
+    cost_per_prompt_token: decimal.Decimal,
+    cost_per_completion_token: decimal.Decimal,
+):
+    """
+    Helper function to insert usage log and update user's credits after streaming.
+    usage_obj is typically chunk.usage from the final chunk.
+    """
+    prompt_tokens = usage_obj.prompt_tokens
+    completion_tokens = usage_obj.completion_tokens
+    total_tokens = usage_obj.total_tokens
+
+    # Calculate cost
+    prompt_cost = prompt_tokens * cost_per_prompt_token
+    completion_cost = completion_tokens * cost_per_completion_token
+    total_cost = prompt_cost + completion_cost
+
+    # Insert usage log
+    usage_log = OpenAIUsageLog(
+        user_id=user.user_id,
+        model=model,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+        cost=total_cost,
+        created_at=datetime.utcnow()
+    )
+    db_session.add(usage_log)
+
+    # Deduct tokens from user's credits
+    user.credits_remaining -= total_tokens
+
+    db_session.commit()
+    db_session.close()
